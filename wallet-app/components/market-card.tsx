@@ -4,6 +4,7 @@ import { ArrowUp, ArrowDown } from "lucide-react"
 import { useState, useRef, useEffect } from "react"
 import { useEthPrice } from "@/hooks/useEthPrice"
 import { useRoundConfig } from "@/hooks/useRoundConfig"
+import EthPriceChart from "./eth-price-chart"
 
 interface MarketCardProps {
   marketName: string
@@ -24,6 +25,8 @@ export default function MarketCard({ marketName, onSwipeComplete, hasSwipedThisR
   const [rotation, setRotation] = useState(0)
   const [isMagnetized, setIsMagnetized] = useState(false)
   const [timerProgress, setTimerProgress] = useState(0)
+  const [lockPrice, setLockPrice] = useState<number | null>(null)
+  const [hasLockedPrice, setHasLockedPrice] = useState(false)
   const dragStartX = useRef(0)
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const audioContextRef = useRef<AudioContext | null>(null)
@@ -32,15 +35,17 @@ export default function MarketCard({ marketName, onSwipeComplete, hasSwipedThisR
   const timerStartRef = useRef<number>(Date.now())
 
   useEffect(() => {
-    // Use on-chain interval seconds, fallback to 30 seconds if not loaded yet
-    const ROUND_DURATION = (intervalSeconds || 30) * 1000 // Convert to milliseconds
+    // Contract uses 2 × intervalSeconds for full round duration
+    const ROUND_DURATION = ((intervalSeconds || 30) * 2) * 1000 // Convert to milliseconds
 
     // Log timing configuration when loaded
     if (intervalSeconds && bufferSeconds) {
       console.log('⏱️ Using on-chain round timing:')
-      console.log(`   Round Duration: ${intervalSeconds}s`)
-      console.log(`   Betting Window: ${intervalSeconds - bufferSeconds}s (open for bets)`)
-      console.log(`   Buffer Period: ${bufferSeconds}s (last ${bufferSeconds}s - swipes disabled)`)
+      console.log(`   Full Round Duration: ${intervalSeconds * 2}s (2 × intervalSeconds)`)
+      console.log(`   Betting Phase: 0-${intervalSeconds}s (open for bets)`)
+      console.log(`   Lock Phase: ${intervalSeconds}-${intervalSeconds * 2}s (betting disabled, waiting for close price)`)
+      console.log(`   Lock Price captured at: ${intervalSeconds}s`)
+      console.log(`   Close Price captured at: ${intervalSeconds * 2}s`)
     }
 
     const updateTimer = () => {
@@ -48,9 +53,25 @@ export default function MarketCard({ marketName, onSwipeComplete, hasSwipedThisR
       const progress = Math.min((elapsed / ROUND_DURATION) * 100, 100)
       setTimerProgress(progress)
 
+      // Capture lock price at 50% (30s mark) - this is what determines winners
+      if (progress >= 50 && !hasLockedPrice && marketName === "ETH" && ethPrice !== null) {
+        setLockPrice(ethPrice)
+        setHasLockedPrice(true)
+        console.log(`🔒 Lock Price captured at 50%: $${ethPrice.toFixed(4)}`)
+        console.log(`   Users are betting: Will close price be higher or lower than $${ethPrice.toFixed(4)}?`)
+      }
+
+      // Reset for next round at 100%
       if (progress >= 100) {
-        // Reset timer for next round
+        console.log(`🏁 Round ended at 100%. Close Price: $${ethPrice?.toFixed(4) || 'N/A'}`)
+        if (lockPrice !== null && ethPrice !== null) {
+          const diff = ethPrice - lockPrice
+          const winner = diff > 0 ? 'BULLS' : diff < 0 ? 'BEARS' : 'TIE'
+          console.log(`   Winner: ${winner} (Close: $${ethPrice.toFixed(4)} vs Lock: $${lockPrice.toFixed(4)}, Diff: ${diff > 0 ? '+' : ''}${diff.toFixed(4)})`)
+        }
+        // Reset for next round
         timerStartRef.current = Date.now()
+        setHasLockedPrice(false)
         onTimerReset() // Clear swipe tracking for new round
       }
     }
@@ -58,7 +79,7 @@ export default function MarketCard({ marketName, onSwipeComplete, hasSwipedThisR
     const interval = setInterval(updateTimer, 50) // Update every 50ms for smooth animation
 
     return () => clearInterval(interval)
-  }, [onTimerReset, intervalSeconds, bufferSeconds])
+  }, [onTimerReset, intervalSeconds, bufferSeconds, ethPrice, marketName, hasLockedPrice, lockPrice])
 
   useEffect(() => {
     // Initialize audio on client side with mobile-friendly settings and volume boost
@@ -178,21 +199,18 @@ export default function MarketCard({ marketName, onSwipeComplete, hasSwipedThisR
   const iconOpacity = Math.min(Math.abs(dragOffset) / 80, 0.6)
   const iconScale = Math.min(Math.abs(dragOffset) / 80, 1)
 
-  // Calculate lock threshold dynamically from contract values
-  // Lock when entering buffer period (last bufferSeconds of the round)
-  const lockThresholdPercent = intervalSeconds && bufferSeconds
-    ? ((intervalSeconds - bufferSeconds) / intervalSeconds) * 100
-    : 83.33 // Fallback to 83.33% (25/30 * 100)
+  // Calculate lock threshold: 30 seconds for 60s round (50% = when lock price is captured)
+  const lockThresholdPercent = 50
 
-  // Block swiping when in buffer period OR if already swiped this round
+  // Block swiping when in lock phase OR if already swiped this round
   const isSwipeBlocked = timerProgress >= lockThresholdPercent || hasSwipedThisRound
 
-  // Show "Round Locked" popup during buffer period only
+  // Show "Round Locked" popup during lock phase only (50%-100%)
   const showLockedPopup = timerProgress >= lockThresholdPercent && timerProgress < 100
 
   return (
     <div className="relative h-full w-full overflow-hidden select-none">
-      {/* Round Locked Popup - Shows during buffer period only */}
+      {/* Round Locked Popup - Shows during lock phase only (30s-60s) */}
       {showLockedPopup && (
         <div className="absolute inset-0 z-[20] flex items-center justify-center pointer-events-none">
           <div className="bg-black bg-opacity-70 backdrop-blur-sm rounded-2xl px-8 py-6 mx-4 border-2 border-yellow-400">
@@ -312,28 +330,34 @@ export default function MarketCard({ marketName, onSwipeComplete, hasSwipedThisR
 
         {/* Chart Area */}
         <div className="flex-1 mb-4 sm:mb-6 relative">
-          <div className="absolute inset-0 flex items-end justify-center gap-0.5">
-            {Array.from({ length: 60 }).map((_, i) => (
-              <div
-                key={i}
-                className="flex-1 bg-yellow-500 opacity-60 rounded-t"
-                style={{
-                  height: `${Math.sin(i / 10) * 30 + 40}%`,
-                }}
-              />
-            ))}
-          </div>
-          {/* Trend line */}
-          <svg className="absolute inset-0 w-full h-full" preserveAspectRatio="none">
-            <polyline
-              points={Array.from({ length: 60 })
-                .map((_, i) => `${(i / 59) * 100}% ${100 - (Math.sin(i / 10) * 30 + 40)}%`)
-                .join(" ")}
-              fill="none"
-              stroke="rgba(0, 0, 0, 0.8)"
-              strokeWidth="2"
-            />
-          </svg>
+          {marketName === "ETH" ? (
+            <EthPriceChart currentPrice={ethPrice} lockPrice={lockPrice} />
+          ) : (
+            <>
+              <div className="absolute inset-0 flex items-end justify-center gap-0.5">
+                {Array.from({ length: 60 }).map((_, i) => (
+                  <div
+                    key={i}
+                    className="flex-1 bg-yellow-500 opacity-60 rounded-t"
+                    style={{
+                      height: `${Math.sin(i / 10) * 30 + 40}%`,
+                    }}
+                  />
+                ))}
+              </div>
+              {/* Trend line */}
+              <svg className="absolute inset-0 w-full h-full" preserveAspectRatio="none">
+                <polyline
+                  points={Array.from({ length: 60 })
+                    .map((_, i) => `${(i / 59) * 100}% ${100 - (Math.sin(i / 10) * 30 + 40)}%`)
+                    .join(" ")}
+                  fill="none"
+                  stroke="rgba(0, 0, 0, 0.8)"
+                  strokeWidth="2"
+                />
+              </svg>
+            </>
+          )}
         </div>
 
         {/* Profit/Loss Info */}
